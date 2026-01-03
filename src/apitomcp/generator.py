@@ -292,6 +292,92 @@ Return ONLY a JSON object with the authentication type, confidence level, and co
         )
 
 
+async def detect_base_url_from_docs(
+    documentation: str, source_url: str, config: "LLMConfig"
+) -> str:
+    """
+    Use LLM to analyze documentation and extract the API base URL.
+
+    Args:
+        documentation: Scraped documentation content
+        source_url: The URL the documentation was scraped from
+        config: LLM configuration
+
+    Returns:
+        Detected base URL string
+    """
+    import litellm
+    from urllib.parse import urlparse
+
+    litellm.suppress_debug_info = True
+    _set_api_key_env(config)
+
+    model = config.get("llm_model")
+    if not model:
+        # Fallback to source URL domain
+        parsed = urlparse(source_url)
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    # Truncate documentation if too long
+    max_length = 10000
+    doc_sample = documentation[:max_length] if len(documentation) > max_length else documentation
+
+    user_prompt = f"""Analyze this API documentation and determine the base URL for API requests.
+
+SOURCE URL (where documentation was found):
+{source_url}
+
+DOCUMENTATION CONTENT:
+{doc_sample}
+
+Look for:
+- Curl examples with full URLs
+- API endpoint examples
+- Base URL mentioned in text
+- Server URLs
+
+Return ONLY a JSON object with this format:
+{{"base_url": "https://api.example.com", "confidence": "high"}}
+
+confidence levels:
+- high: Found explicit base URL in curl examples or documentation
+- medium: Inferred from endpoint patterns
+- low: Guessed from domain
+
+Return ONLY the JSON, no other text."""
+
+    try:
+        response = await litellm.acompletion(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You extract API base URLs from documentation. Return only valid JSON."},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=200,
+            temperature=0.1,
+        )
+
+        # Track usage
+        global _current_stats
+        if _current_stats:
+            _current_stats.add_response(response, model)
+
+        content = response.choices[0].message.content
+        result = extract_json(content)
+        
+        base_url = result.get("base_url", "")
+        if base_url and base_url.startswith("http"):
+            # Clean up trailing slashes
+            return base_url.rstrip("/")
+
+    except Exception:
+        pass
+
+    # Fallback to source URL domain
+    parsed = urlparse(source_url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 SYSTEM_PROMPT = """You are an expert API documentation analyzer and OpenAPI specification generator.
 
 Your task is to analyze the provided API operation documentation and generate a valid OpenAPI 3.1.0 path item in JSON format.
@@ -405,75 +491,95 @@ async def generate_operation_spec(
         examples_section=examples_section,
     )
 
-    try:
-        response = await litellm.acompletion(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=4000,
-            temperature=0.1,
-        )
-
-        # Track usage
-        stats.add_response(response, model)
-
-        # Extract content
-        content = response.choices[0].message.content
-
-        # Parse JSON
+    # Retry logic: attempt up to 2 times (1 initial + 1 retry)
+    max_attempts = 2
+    last_error = None
+    
+    for attempt in range(max_attempts):
         try:
-            spec = extract_json(content)
-        except ValueError as e:
-            return None, f"Invalid JSON: {str(e)[:50]}"
+            response = await litellm.acompletion(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=4000,
+                temperature=0.1,
+            )
 
-        method_lower = operation.method.lower()
-        method_upper = operation.method.upper()
-        
-        # Check for expected structure: {"get": {...}} or {"GET": {...}}
-        if method_lower in spec:
-            return spec, ""
-        
-        if method_upper in spec:
-            spec[method_lower] = spec.pop(method_upper)
-            return spec, ""
-        
-        # Handle LLM returning operation directly without method wrapper
-        if "operationId" in spec or "operation_id" in spec or "summary" in spec:
-            return {method_lower: spec}, ""
-        
-        # Handle LLM returning path as key: {"/albums": {...}} or {"/albums": {"get": {...}}}
-        for key in list(spec.keys()):
-            if key.startswith("/"):
-                path_data = spec[key]
-                # Check if it's {"/path": {"get": {...}}}
-                if isinstance(path_data, dict):
-                    if method_lower in path_data:
-                        return {method_lower: path_data[method_lower]}, ""
-                    if method_upper in path_data:
-                        return {method_lower: path_data[method_upper]}, ""
-                    # It's {"/path": {operationId, summary, ...}} - the operation directly
-                    if "operationId" in path_data or "operation_id" in path_data or "summary" in path_data:
-                        return {method_lower: path_data}, ""
-        
-        # Handle nested structure like {"paths": {"/path": {"get": {...}}}}
-        if "paths" in spec:
-            paths = spec["paths"]
-            for path_key, path_item in paths.items():
-                if isinstance(path_item, dict):
-                    if method_lower in path_item:
-                        return {method_lower: path_item[method_lower]}, ""
-                    if method_upper in path_item:
-                        return {method_lower: path_item[method_upper]}, ""
-        
-        # Show what keys were actually returned for debugging
-        keys = list(spec.keys())[:3]
-        return None, f"Unexpected format: {keys}"
+            # Track usage
+            stats.add_response(response, model)
 
-    except Exception as e:
-        error_msg = str(e)[:50] if str(e) else type(e).__name__
-        return None, f"LLM error: {error_msg}"
+            # Extract content
+            content = response.choices[0].message.content
+
+            # Parse JSON
+            try:
+                spec = extract_json(content)
+            except ValueError as e:
+                last_error = f"Invalid JSON: {str(e)[:50]}"
+                # Retry if this was not the last attempt
+                if attempt < max_attempts - 1:
+                    continue
+                return None, last_error
+
+            method_lower = operation.method.lower()
+            method_upper = operation.method.upper()
+            
+            # Check for expected structure: {"get": {...}} or {"GET": {...}}
+            if method_lower in spec:
+                return spec, ""
+            
+            if method_upper in spec:
+                spec[method_lower] = spec.pop(method_upper)
+                return spec, ""
+            
+            # Handle LLM returning operation directly without method wrapper
+            if "operationId" in spec or "operation_id" in spec or "summary" in spec:
+                return {method_lower: spec}, ""
+            
+            # Handle LLM returning path as key: {"/albums": {...}} or {"/albums": {"get": {...}}}
+            for key in list(spec.keys()):
+                if key.startswith("/"):
+                    path_data = spec[key]
+                    # Check if it's {"/path": {"get": {...}}}
+                    if isinstance(path_data, dict):
+                        if method_lower in path_data:
+                            return {method_lower: path_data[method_lower]}, ""
+                        if method_upper in path_data:
+                            return {method_lower: path_data[method_upper]}, ""
+                        # It's {"/path": {operationId, summary, ...}} - the operation directly
+                        if "operationId" in path_data or "operation_id" in path_data or "summary" in path_data:
+                            return {method_lower: path_data}, ""
+            
+            # Handle nested structure like {"paths": {"/path": {"get": {...}}}}
+            if "paths" in spec:
+                paths = spec["paths"]
+                for path_key, path_item in paths.items():
+                    if isinstance(path_item, dict):
+                        if method_lower in path_item:
+                            return {method_lower: path_item[method_lower]}, ""
+                        if method_upper in path_item:
+                            return {method_lower: path_item[method_upper]}, ""
+            
+            # Show what keys were actually returned for debugging
+            keys = list(spec.keys())[:3]
+            last_error = f"Unexpected format: {keys}"
+            # Retry if this was not the last attempt
+            if attempt < max_attempts - 1:
+                continue
+            return None, last_error
+
+        except Exception as e:
+            error_msg = str(e)[:50] if str(e) else type(e).__name__
+            last_error = f"LLM error: {error_msg}"
+            # Retry if this was not the last attempt and it's not a fatal error
+            if attempt < max_attempts - 1:
+                continue
+            return None, last_error
+    
+    # Should not reach here, but return last error if we do
+    return None, last_error or "Generation failed after retries"
 
 
 async def generate_openapi_spec_parallel(

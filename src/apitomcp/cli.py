@@ -403,7 +403,6 @@ def generate() -> None:
             raise typer.Exit(1)
 
     print_success(f"Scraped {scrape_result.pages_scraped} pages")
-    print_info(f"Detected base URL: {scrape_result.base_url}")
 
     # Show operations found
     if scrape_result.operations:
@@ -415,6 +414,19 @@ def generate() -> None:
             console.print(f"  [muted]... and {len(scrape_result.operations) - 5} more[/muted]")
     else:
         print_warning("No explicit operations found, will use full documentation")
+
+    # Use LLM to detect base URL from documentation
+    from apitomcp.generator import detect_base_url_from_docs
+    
+    with spinner("Detecting API base URL..."):
+        detected_base_url = _run_async(
+            detect_base_url_from_docs(scrape_result.raw_markdown, url, config)
+        )
+    
+    # Prompt user to confirm/modify the base URL
+    base_url = prompt_text("Enter the API base URL", default=detected_base_url)
+    if not base_url:
+        base_url = detected_base_url
 
     # Generate server name from URL
     from urllib.parse import urlparse
@@ -446,7 +458,7 @@ def generate() -> None:
                 generate_openapi_spec_parallel(
                     operations=scrape_result.operations,
                     config=config,
-                    base_url=scrape_result.base_url,
+                    base_url=base_url,
                     api_title=server_name.title().replace("_", " ") + " API",
                 )
             )
@@ -468,9 +480,7 @@ def generate() -> None:
         console.print(usage_stats.format_summary())
         
         # Show base API URL
-        base_url = scrape_result.base_url or openapi_spec.get("servers", [{}])[0].get("url", "")
-        if base_url:
-            console.print(f"  Base URL: {base_url}")
+        console.print(f"  Base URL: {base_url}")
         console.print()
         
         # Show detailed operation results in a table
@@ -504,6 +514,34 @@ def generate() -> None:
                 )
             
             print_table(table)
+        else:
+            # For single-call generation, extract tools from the spec and display
+            from apitomcp.ui import create_table, print_table
+            
+            paths = openapi_spec.get("paths", {})
+            if paths:
+                tool_count = sum(
+                    1 for path_item in paths.values()
+                    for method in ["get", "post", "put", "patch", "delete", "head", "options"]
+                    if method in path_item
+                )
+                table = create_table(
+                    f"Generated Tools ({tool_count})",
+                    ["Method", "Path", "Tool ID", "Summary"]
+                )
+                
+                for path, path_item in sorted(paths.items()):
+                    for method in ["get", "post", "put", "patch", "delete", "head", "options"]:
+                        if method in path_item:
+                            op = path_item[method]
+                            table.add_row(
+                                method.upper(),
+                                path,
+                                op.get("operationId", "-"),
+                                op.get("summary", "-")[:50],
+                            )
+                
+                print_table(table)
 
     # Detect authentication using LLM analysis
     from apitomcp.generator import (
@@ -665,7 +703,7 @@ def generate() -> None:
         "server_name": server_name,
         "source_url": url,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "base_url": scrape_result.base_url or openapi_spec.get("servers", [{}])[0].get("url", ""),
+        "base_url": base_url,
         "auth": auth_config,
         "tool_count": tool_count,
         "tool_overrides": {},
@@ -676,14 +714,79 @@ def generate() -> None:
 
     print_success(f"Server '{server_name}' created with {tool_count} tools!")
     
-    # Check if already installed in Cursor
-    from apitomcp.installer import is_installed_in_cursor
+    # Smart installation detection and prompt for Cursor and Claude Desktop
+    from InquirerPy.base.control import Choice
+
+    from apitomcp.installer import (
+        detect_available_targets,
+        install_to_target,
+        is_installed_in_target,
+    )
+    from apitomcp.ui import prompt_confirm, prompt_select_multiple
     
-    if is_installed_in_cursor(server_name):
-        print_info(f"Server '{server_name}' is already configured in Cursor.")
-        print_info("Restart Cursor to pick up the changes.")
+    targets = detect_available_targets()
+    if not targets:
+        print_info("No MCP clients detected. Run 'apitomcp install' after installing Cursor or Claude Desktop.")
     else:
-        print_info("Run 'apitomcp install' to add it to Cursor.")
+        # Check which targets already have this server installed
+        already_installed = [t for t in targets if is_installed_in_target(server_name, t.config_path)]
+        not_installed = [t for t in targets if not is_installed_in_target(server_name, t.config_path)]
+        
+        # Notify about updates to existing installations
+        for target in already_installed:
+            target_label = "Cursor" if target.name == "cursor" else "Claude Desktop"
+            print_info(f"Server '{server_name}' updated in {target_label}. Restart to apply changes.")
+        
+        # Offer to install to new targets
+        if not_installed:
+            console.print()
+            if len(not_installed) == 1:
+                target = not_installed[0]
+                target_label = "Cursor" if target.name == "cursor" else "Claude Desktop"
+                print_info(f"{target_label} detected at {target.config_path}")
+                if prompt_confirm(f"Install '{server_name}' to {target_label}?", default=True):
+                    try:
+                        install_to_target(server_name, target.config_path)
+                        print_success(f"Installed '{server_name}' to {target_label}!")
+                        print_info(f"Restart {target_label} to start using this MCP server.")
+                    except Exception as e:
+                        print_error(f"Failed to install: {e}")
+                        print_info("You can manually run 'apitomcp install' later.")
+                else:
+                    print_info("Run 'apitomcp install' to add it later.")
+            else:
+                # Multiple targets available - let user select
+                print_info("Multiple MCP clients detected:")
+                for target in not_installed:
+                    print_info(f"  • {target.display_name}")
+                
+                choices = [
+                    Choice(value=target.name, name=target.display_name)
+                    for target in not_installed
+                ]
+                
+                console.print("[muted]Use space to toggle, enter to confirm[/muted]")
+                selected_names = prompt_select_multiple(
+                    f"Install '{server_name}' to",
+                    choices,
+                )
+                
+                if selected_names:
+                    restart_targets = []
+                    for target in not_installed:
+                        if target.name in selected_names:
+                            try:
+                                install_to_target(server_name, target.config_path)
+                                target_label = "Cursor" if target.name == "cursor" else "Claude Desktop"
+                                print_success(f"Installed '{server_name}' to {target_label}!")
+                                restart_targets.append(target_label)
+                            except Exception as e:
+                                print_error(f"Failed to install to {target.name}: {e}")
+                    
+                    if restart_targets:
+                        print_info(f"Restart {' and '.join(restart_targets)} to start using this MCP server.")
+                else:
+                    print_info("Run 'apitomcp install' to add it later.")
 
 
 def count_tools(spec: dict) -> int:
@@ -802,48 +905,81 @@ def delete() -> None:
 
 @app.command()
 def install() -> None:
-    """Install generated servers to Cursor."""
+    """Install generated servers to Cursor and/or Claude Desktop."""
+    from InquirerPy.base.control import Choice
+
     from apitomcp.config import list_servers as get_servers
-    from apitomcp.installer import detect_cursor_config, install_to_cursor
+    from apitomcp.installer import detect_available_targets, install_to_target, is_installed_in_target
     from apitomcp.ui import (
+        console,
         print_error,
         print_header,
         print_info,
         print_success,
         print_warning,
-        prompt_confirm,
+        prompt_select_multiple,
     )
 
-    print_header("Install to Cursor")
+    print_header("Install MCP Servers")
 
     servers = get_servers()
     if not servers:
         print_error("No servers generated yet. Run 'apitomcp generate' first.")
         raise typer.Exit(1)
 
-    # Detect Cursor config
-    cursor_config_path = detect_cursor_config()
-    if not cursor_config_path:
-        print_error("Could not find Cursor configuration.")
-        print_info("Make sure Cursor is installed and has been run at least once.")
+    # Detect available targets
+    targets = detect_available_targets()
+    if not targets:
+        print_error("No MCP clients found.")
+        print_info("Make sure Cursor or Claude Desktop is installed and has been run at least once.")
         raise typer.Exit(1)
 
-    print_info(f"Found Cursor config at: {cursor_config_path}")
+    print_info(f"Found servers: {', '.join(sorted(servers))}")
 
-    # Confirm installation
-    print_info(f"Servers to install: {', '.join(servers)}")
-    if not prompt_confirm("Install all servers to Cursor?"):
+    # Check which targets already have any of the servers installed
+    def has_any_server_installed(target):
+        return any(is_installed_in_target(s, target.config_path) for s in servers)
+
+    # Multi-select for installation targets, pre-select targets that already have servers
+    choices = [
+        Choice(
+            value=target.name,
+            name=target.display_name,
+            enabled=has_any_server_installed(target),
+        )
+        for target in targets
+    ]
+
+    console.print("[muted]Use space to toggle, enter to confirm[/muted]")
+    selected_names = prompt_select_multiple(
+        "Select installation targets",
+        choices,
+    )
+
+    if not selected_names:
+        print_info("No targets selected. Cancelled.")
         raise typer.Exit(0)
 
-    # Install each server
-    for server_name in servers:
-        try:
-            install_to_cursor(server_name, cursor_config_path)
-            print_success(f"Installed '{server_name}'")
-        except Exception as e:
-            print_error(f"Failed to install '{server_name}': {e}")
+    selected_targets = [t for t in targets if t.name in selected_names]
 
-    print_warning("Please restart Cursor for changes to take effect.")
+    # Install each server to each target
+    target_names = []
+    for target in selected_targets:
+        for server_name in sorted(servers):
+            try:
+                install_to_target(server_name, target.config_path)
+                target_label = "Cursor" if target.name == "cursor" else "Claude Desktop"
+                print_success(f"Installed '{server_name}' to {target_label}")
+            except Exception as e:
+                print_error(f"Failed to install '{server_name}' to {target.name}: {e}")
+
+        if target.name == "cursor":
+            target_names.append("Cursor")
+        else:
+            target_names.append("Claude Desktop")
+
+    if target_names:
+        print_warning(f"Please restart {' and '.join(target_names)} for changes to take effect.")
 
 
 @app.command()

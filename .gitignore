@@ -45,3 +45,5 @@ Thumbs.db
 
 # Project specific
 .python-version
+
+.env

@@ -1,43 +1,41 @@
 """Interactive CLI utilities using InquirerPy for modern UX."""
 
-import sys
 from contextlib import contextmanager
 from typing import Callable, Generator
 
 from InquirerPy import inquirer
 from InquirerPy.base.control import Choice
+from InquirerPy.utils import get_style
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.theme import Theme
 
-# Track whether we can use interactive prompts
-_use_interactive = None
+# Prompt styling - like create-next-app
+QMARK = "?"  # Question mark for unanswered questions
+AMARK = "✔"  # Checkmark for answered questions
 
-
-def _can_use_interactive() -> bool:
-    """Check if we can use interactive InquirerPy prompts."""
-    global _use_interactive
-    
-    if _use_interactive is not None:
-        return _use_interactive
-    
-    # Check if stdin is a TTY
-    if not sys.stdin.isatty():
-        _use_interactive = False
-        return False
-    
-    # On Windows, prompt_toolkit can spawn a new console window which is jarring.
-    # Use Rich prompts on Windows for more reliable behavior.
-    if sys.platform == "win32":
-        _use_interactive = False
-        return False
-    
-    # On Unix-like systems, InquirerPy works well
-    _use_interactive = True
-    return _use_interactive
+# InquirerPy style customization
+PROMPT_STYLE = get_style({
+    "questionmark": "#5f87ff",  # Blue question mark
+    "answermark": "#5fd75f",    # Green checkmark
+    "answer": "#5fd75f",        # Green answer text
+    "input": "#00d9ff",         # Cyan input text (distinct from prompt)
+    "question": "",             # Default question color
+    "answered_question": "",    # Default answered question color
+    "instruction": "#7f7f7f",   # Gray instructions
+    "pointer": "#5f87ff",       # Blue pointer
+    "checkbox": "#5f87ff",      # Blue checkbox
+    "separator": "",
+    "skipped": "#7f7f7f",
+    "validator": "",
+    "marker": "#5fd75f",        # Green marker
+    "fuzzy_prompt": "#5f87ff",
+    "fuzzy_info": "#7f7f7f",
+    "fuzzy_border": "#5f87ff",
+    "fuzzy_match": "#5fd75f",
+}, style_override=False)
 
 # Custom theme for Rich console output (tables, panels, etc.)
 theme = Theme(
@@ -105,37 +103,25 @@ def prompt_text(
     Returns:
         The user's input string
     """
-    if _can_use_interactive():
-        try:
-            if password:
-                result = inquirer.secret(
-                    message=message,
-                    default=default or "",
-                    validate=validate,
-                ).execute()
-            else:
-                result = inquirer.text(
-                    message=message,
-                    default=default or "",
-                    validate=validate,
-                ).execute()
-            return result or ""
-        except Exception:
-            pass  # Fall back to Rich prompt
-    
-    # Fallback to Rich prompt
     if password:
-        import getpass
-        prompt_str = f"{message}"
-        if default:
-            prompt_str += f" ({default})"
-        prompt_str += ": "
-        console.print(f"[bold]{prompt_str}[/bold]", end="")
-        result = getpass.getpass("")
-        return result if result else (default or "")
+        result = inquirer.secret(
+            message=message,
+            default=default or "",
+            validate=validate,
+            qmark=QMARK,
+            amark=AMARK,
+            style=PROMPT_STYLE,
+        ).execute()
     else:
-        result = Prompt.ask(message, default=default or "", console=console)
-        return result or ""
+        result = inquirer.text(
+            message=message,
+            default=default or "",
+            validate=validate,
+            qmark=QMARK,
+            amark=AMARK,
+            style=PROMPT_STYLE,
+        ).execute()
+    return result or ""
 
 
 def prompt_confirm(message: str, default: bool = True) -> bool:
@@ -149,17 +135,13 @@ def prompt_confirm(message: str, default: bool = True) -> bool:
     Returns:
         True if user confirms, False otherwise
     """
-    if _can_use_interactive():
-        try:
-            return inquirer.confirm(
-                message=message,
-                default=default,
-            ).execute()
-        except Exception:
-            pass  # Fall back to Rich prompt
-    
-    # Fallback to Rich prompt
-    return Confirm.ask(message, default=default, console=console)
+    return inquirer.confirm(
+        message=message,
+        default=default,
+        qmark=QMARK,
+        amark=AMARK,
+        style=PROMPT_STYLE,
+    ).execute()
 
 
 def prompt_choice(
@@ -178,49 +160,15 @@ def prompt_choice(
     Returns:
         The selected choice string
     """
-    if _can_use_interactive():
-        try:
-            return inquirer.select(
-                message=message,
-                choices=choices,
-                default=default,
-            ).execute()
-        except Exception:
-            pass  # Fall back to numbered selection
-    
-    # Fallback to numbered selection with Rich
-    # Extract string values from Choice objects if needed
-    choice_values = []
-    choice_names = []
-    for c in choices:
-        if isinstance(c, Choice):
-            choice_values.append(c.value)
-            choice_names.append(c.name if c.name else str(c.value))
-        else:
-            choice_values.append(c)
-            choice_names.append(c)
-    
-    console.print(f"\n[bold]{message}[/bold]\n")
-    for i, name in enumerate(choice_names, 1):
-        if default and choice_values[i-1] == default:
-            console.print(f"  [magenta]{i}.[/magenta] {name} [dim](default)[/dim]")
-        else:
-            console.print(f"  [magenta]{i}.[/magenta] {name}")
-    console.print()
-    
-    while True:
-        default_num = None
-        if default and default in choice_values:
-            default_num = str(choice_values.index(default) + 1)
-        
-        response = Prompt.ask("Enter number", default=default_num, console=console)
-        try:
-            index = int(response) - 1
-            if 0 <= index < len(choice_values):
-                return choice_values[index]
-        except ValueError:
-            pass
-        console.print("[red]Invalid selection. Please enter a number.[/red]")
+    return inquirer.select(
+        message=message,
+        choices=choices,
+        default=default,
+        qmark=QMARK,
+        amark=AMARK,
+        style=PROMPT_STYLE,
+        pointer="❯",
+    ).execute()
 
 
 def prompt_select_multiple(
@@ -239,45 +187,15 @@ def prompt_select_multiple(
     Returns:
         List of selected choice strings
     """
-    if _can_use_interactive():
-        try:
-            return inquirer.checkbox(
-                message=message,
-                choices=choices,
-                default=default,
-            ).execute()
-        except Exception:
-            pass  # Fall back to comma-separated input
-    
-    # Fallback: show choices and ask for comma-separated numbers
-    choice_values = []
-    choice_names = []
-    for c in choices:
-        if isinstance(c, Choice):
-            choice_values.append(c.value)
-            choice_names.append(c.name if c.name else str(c.value))
-        else:
-            choice_values.append(c)
-            choice_names.append(c)
-    
-    console.print(f"\n[bold]{message}[/bold]\n")
-    for i, name in enumerate(choice_names, 1):
-        selected = default and choice_values[i-1] in default
-        marker = "[green]✓[/green]" if selected else " "
-        console.print(f"  {marker} [magenta]{i}.[/magenta] {name}")
-    console.print()
-    
-    response = Prompt.ask("Enter numbers (comma-separated)", console=console)
-    selected = []
-    for part in response.split(","):
-        try:
-            index = int(part.strip()) - 1
-            if 0 <= index < len(choice_values):
-                selected.append(choice_values[index])
-        except ValueError:
-            pass
-    
-    return selected if selected else (default or [])
+    return inquirer.checkbox(
+        message=message,
+        choices=choices,
+        default=default,
+        qmark=QMARK,
+        amark=AMARK,
+        style=PROMPT_STYLE,
+        pointer="❯",
+    ).execute()
 
 
 def prompt_fuzzy(
@@ -296,18 +214,15 @@ def prompt_fuzzy(
     Returns:
         The selected choice string
     """
-    if _can_use_interactive():
-        try:
-            return inquirer.fuzzy(
-                message=message,
-                choices=choices,
-                default=default,
-            ).execute()
-        except Exception:
-            pass  # Fall back to regular choice
-    
-    # Fallback to regular prompt_choice
-    return prompt_choice(message, choices, default)
+    return inquirer.fuzzy(
+        message=message,
+        choices=choices,
+        default=default,
+        qmark=QMARK,
+        amark=AMARK,
+        style=PROMPT_STYLE,
+        pointer="❯",
+    ).execute()
 
 
 @contextmanager
