@@ -27,9 +27,24 @@ warnings.filterwarnings(
 )
 
 
+def _get_event_loop():
+    """Get or create a reusable event loop."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        return loop
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 def _run_async(coro):
-    """Run async code."""
-    return asyncio.run(coro)
+    """Run async code in a reusable event loop."""
+    loop = _get_event_loop()
+    return loop.run_until_complete(coro)
 
 from apitomcp import __version__
 
@@ -108,22 +123,36 @@ def main(
     pass
 
 
-def _select_provider(current_provider: str | None = None) -> str:
-    """Prompt user to select an LLM provider with arrow key navigation."""
+def _select_provider(current_provider: str | None = None, allow_skip: bool = False) -> str | None:
+    """Prompt user to select an LLM provider with arrow key navigation.
+    
+    If allow_skip is True and current_provider is set, adds a skip option.
+    Returns None if user chooses to skip.
+    """
+    from InquirerPy.base.control import Choice
+
     from apitomcp.ui import prompt_choice
 
     providers = list(PROVIDERS.keys())
+    
+    if allow_skip and current_provider and current_provider in PROVIDERS:
+        choices = [
+            Choice(value="__skip__", name=f"Keep current ({current_provider})"),
+            *providers,
+        ]
+        selected = prompt_choice("Select your LLM provider", choices, default="__skip__")
+        return None if selected == "__skip__" else selected
+    
     default = current_provider if current_provider in PROVIDERS else providers[0]
-
-    return prompt_choice(
-        "Select your LLM provider",
-        providers,
-        default=default,
-    )
+    return prompt_choice("Select your LLM provider", providers, default=default)
 
 
-def _select_model(provider: str, current_model: str | None = None) -> str:
-    """Prompt user to select a model or enter a custom one with arrow key navigation."""
+def _select_model(provider: str, current_model: str | None = None, allow_skip: bool = False) -> str | None:
+    """Prompt user to select a model or enter a custom one with arrow key navigation.
+    
+    If allow_skip is True and current_model is set, adds a skip option.
+    Returns None if user chooses to skip.
+    """
     from InquirerPy.base.control import Choice
 
     from apitomcp.ui import prompt_choice, prompt_text
@@ -132,20 +161,34 @@ def _select_model(provider: str, current_model: str | None = None) -> str:
     models = provider_info["models"]
 
     # Build choices with display names and values
-    choices = [
+    choices = []
+    
+    # Add skip option if allowed and there's a current model
+    if allow_skip and current_model:
+        choices.append(Choice(value="__skip__", name=f"Keep current ({current_model})"))
+    
+    choices.extend([
         Choice(value=model_id, name=f"{model_id} ({desc})")
         for model_id, desc in models
-    ]
+    ])
     choices.append(Choice(value="__custom__", name="Enter custom model"))
 
     # Determine default
-    default = current_model if current_model in [m[0] for m in models] else models[0][0]
+    if allow_skip and current_model:
+        default = "__skip__"
+    elif current_model in [m[0] for m in models]:
+        default = current_model
+    else:
+        default = models[0][0]
 
     selected = prompt_choice(
         f"Select a model for {provider}",
         choices,
         default=default,
     )
+
+    if selected == "__skip__":
+        return None
 
     if selected == "__custom__":
         custom = prompt_text("Enter the model identifier (e.g., anthropic/claude-sonnet-4)")
@@ -236,49 +279,83 @@ def init() -> None:
 
     # Check if already configured
     current_config = load_config()
-    if current_config.get("llm_api_key"):
+    is_configured = bool(current_config.get("llm_api_key"))
+    
+    if is_configured:
         print_info(f"Already configured with {current_config.get('llm_provider', 'unknown')}.")
         print_info("Run 'apitomcp auth' to change your settings.\n")
 
-    # Provider selection
-    provider = _select_provider(current_config.get("llm_provider"))
+    # Provider selection (with skip option if already configured)
+    selected_provider = _select_provider(
+        current_config.get("llm_provider"),
+        allow_skip=is_configured,
+    )
+    provider = selected_provider if selected_provider else current_config.get("llm_provider")
 
-    # API key (masked input for security)
-    api_key = prompt_text(f"Enter your {provider} API key", password=True)
-    if not api_key:
-        print_error("API key is required.")
-        raise typer.Exit(1)
-
-    # Model selection
-    model = _select_model(provider, current_config.get("llm_model"))
-
-    # Validate
-    with spinner(f"Validating {provider} credentials..."):
-        try:
-            _validate_api_key(provider, api_key, model)
-        except ValidationError as e:
-            print_error(str(e))
+    # API key handling
+    if selected_provider is None:
+        # User skipped provider selection, offer to keep existing key
+        api_key = prompt_text(
+            f"Enter {provider} API key (leave blank to keep current)",
+            password=True,
+        )
+        if not api_key:
+            api_key = current_config.get("llm_api_key", "")
+    elif selected_provider == current_config.get("llm_provider"):
+        # Same provider selected, offer to keep existing key
+        api_key = prompt_text(
+            f"Enter {provider} API key (leave blank to keep current)",
+            password=True,
+        )
+        if not api_key:
+            api_key = current_config.get("llm_api_key", "")
+    else:
+        # New provider, require new key
+        api_key = prompt_text(f"Enter your {provider} API key", password=True)
+        if not api_key:
+            print_error("API key is required.")
             raise typer.Exit(1)
 
-    # Save config
-    save_config({
-        "llm_provider": provider,
-        "llm_api_key": api_key,
-        "llm_model": model,
-    })
+    # Model selection (with skip option if already configured and same provider)
+    can_skip_model = is_configured and (selected_provider is None or selected_provider == current_config.get("llm_provider"))
+    selected_model = _select_model(
+        provider,
+        current_config.get("llm_model"),
+        allow_skip=can_skip_model,
+    )
+    model = selected_model if selected_model else current_config.get("llm_model")
 
-    print_success("Configuration saved!")
+    # Check if anything changed
+    nothing_changed = (
+        provider == current_config.get("llm_provider")
+        and api_key == current_config.get("llm_api_key")
+        and model == current_config.get("llm_model")
+    )
+
+    # Skip validation if nothing changed, otherwise validate and save
+    if nothing_changed:
+        print_success("Configuration unchanged!")
+    else:
+        with spinner(f"Validating {provider} credentials..."):
+            try:
+                _validate_api_key(provider, api_key, model)
+            except ValidationError as e:
+                print_error(str(e))
+                raise typer.Exit(1)
+
+        # Save config
+        save_config({
+            "llm_provider": provider,
+            "llm_api_key": api_key,
+            "llm_model": model,
+        })
+
+        print_success("Configuration saved!")
     print_divider()
 
     # Show next steps
-    console.print("[bold]You're all set! Here's how to use apitomcp:[/bold]\n")
-    console.print("  [highlight]1.[/highlight] Generate an MCP server from API docs:")
-    console.print("     [cyan]apitomcp generate[/cyan]\n")
-    console.print("  [highlight]2.[/highlight] Install servers to Cursor:")
-    console.print("     [cyan]apitomcp install[/cyan]\n")
-    console.print("  [highlight]3.[/highlight] Restart Cursor and start chatting with your APIs!\n")
-    print_divider()
-    console.print("[muted]Other commands: list, output, auth[/muted]")
+    console.print("[bold]You're all set! Now you can generate an MCP server from API docs:[/bold]\n")
+    console.print("[cyan]apitomcp generate[/cyan]\n")
 
 
 @app.command()
@@ -383,37 +460,80 @@ def generate() -> None:
 
     # Import heavy modules now (after UI is shown)
     from apitomcp.generator import (
+        ExtractionProgress,
+        extract_operations_parallel,
         generate_openapi_spec,
         generate_openapi_spec_parallel,
         get_current_usage_stats,
         reset_usage_stats,
     )
-    from apitomcp.scraper import scrape_documentation
+    from apitomcp.scraper import ScrapeProgress, scrape_documentation
+    from apitomcp.ui import LiveStatus
     from apitomcp.validator import validate_and_retry
 
     # Reset usage stats for this generation
     reset_usage_stats()
 
-    # Scrape documentation with new enhanced scraper
-    with spinner("Scraping documentation..."):
-        try:
-            scrape_result = scrape_documentation(url)
-        except Exception as e:
-            print_error(f"Failed to scrape documentation: {e}")
-            raise typer.Exit(1)
+    # Phase 1: Scrape documentation with live progress
+    try:
+        with LiveStatus() as status:
+            def on_scrape_progress(progress: ScrapeProgress) -> None:
+                # Truncate URL for display
+                short_url = progress.current_url
+                if len(short_url) > 50:
+                    short_url = "..." + short_url[-47:]
+                status.update(
+                    f"Scraping {progress.pages_scraped} pages | {short_url}"
+                )
+
+            scrape_result = scrape_documentation(url, on_progress=on_scrape_progress)
+    except Exception as e:
+        print_error(f"Failed to scrape documentation: {e}")
+        raise typer.Exit(1)
 
     print_success(f"Scraped {scrape_result.pages_scraped} pages")
 
-    # Show operations found
-    if scrape_result.operations:
-        print_info(f"Found {len(scrape_result.operations)} API operations")
-        # Show first few operations
-        for op in scrape_result.operations[:5]:
-            console.print(f"  [muted]• {op.method} {op.path}[/muted]")
-        if len(scrape_result.operations) > 5:
-            console.print(f"  [muted]... and {len(scrape_result.operations) - 5} more[/muted]")
+    # Phase 2: LLM extracts operations from each page
+    if not scrape_result.page_markdowns:
+        print_error("No content found in scraped pages.")
+        raise typer.Exit(1)
+
+    print_info(f"Extracting API operations from {len(scrape_result.page_markdowns)} pages...")
+    
+    try:
+        with LiveStatus() as status:
+            def on_extraction_progress(progress: ExtractionProgress) -> None:
+                short_url = progress.current_url
+                if len(short_url) > 40:
+                    short_url = "..." + short_url[-37:]
+                status.update(
+                    f"Extracting {progress.pages_processed}/{progress.total_pages} pages, "
+                    f"{progress.operations_found} ops | {short_url}"
+                )
+
+            operations, extraction_stats = _run_async(
+                extract_operations_parallel(
+                    pages=scrape_result.page_markdowns,
+                    config=config,
+                    on_progress=on_extraction_progress,
+                )
+            )
+    except Exception as e:
+        print_error(f"Failed to extract operations: {e}")
+        raise typer.Exit(1)
+
+    # Show extraction results
+    if operations:
+        print_success(f"Found {len(operations)} API operations")
+        for op in operations[:5]:
+            console.print(f"  [dim]• {op.method} {op.path}[/dim]")
+        if len(operations) > 5:
+            console.print(f"  [dim]... and {len(operations) - 5} more[/dim]")
+        
+        # Show extraction cost
+        console.print(f"\n[dim]Extraction: {extraction_stats.format_summary()}[/dim]")
     else:
-        print_warning("No explicit operations found, will use full documentation")
+        print_warning("No API operations found in documentation")
 
     # Use LLM to detect base URL from documentation
     from apitomcp.generator import detect_base_url_from_docs
@@ -445,25 +565,33 @@ def generate() -> None:
     # Sanitize server name
     server_name = server_name.lower().replace(" ", "_").replace("-", "_")
 
-    # Generate OpenAPI spec using appropriate method
+    # Phase 3: Generate OpenAPI spec from extracted operations
     print_info("Generating OpenAPI specification...")
 
     try:
-        if scrape_result.operations and len(scrape_result.operations) >= 3:
+        if operations and len(operations) >= 1:
             # Use parallel generation for operations
-            print_info(f"Processing {len(scrape_result.operations)} operations in parallel...")
+            print_info(f"Processing {len(operations)} operations...")
 
             # Run async generation
-            openapi_spec, usage_stats = _run_async(
+            openapi_spec, generation_stats = _run_async(
                 generate_openapi_spec_parallel(
-                    operations=scrape_result.operations,
+                    operations=operations,
                     config=config,
                     base_url=base_url,
                     api_title=server_name.title().replace("_", " ") + " API",
                 )
             )
+            # Combine stats from extraction and generation
+            usage_stats = generation_stats
+            usage_stats.total_tokens += extraction_stats.total_tokens
+            usage_stats.prompt_tokens += extraction_stats.prompt_tokens
+            usage_stats.completion_tokens += extraction_stats.completion_tokens
+            usage_stats.total_cost += extraction_stats.total_cost
+            usage_stats.calls += extraction_stats.calls
         else:
-            # Fallback to single-call generation for small docs
+            # Fallback to single-call generation for docs with no extracted operations
+            print_warning("No operations extracted, using full documentation...")
             openapi_spec = validate_and_retry(
                 lambda: generate_openapi_spec(scrape_result.raw_markdown, config),
                 config,

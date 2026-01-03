@@ -9,6 +9,7 @@ from InquirerPy.utils import get_style
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.status import Status
 from rich.table import Table
 from rich.theme import Theme
 
@@ -236,6 +237,27 @@ def spinner(message: str) -> Generator[None, None, None]:
     ) as progress:
         progress.add_task(description=message, total=None)
         yield
+
+
+class LiveStatus:
+    """A live-updating status display with animated spinner."""
+
+    def __init__(self) -> None:
+        self._status: Status | None = None
+
+    def __enter__(self) -> "LiveStatus":
+        self._status = console.status("", spinner="dots")
+        self._status.__enter__()
+        return self
+
+    def __exit__(self, *args) -> None:
+        if self._status:
+            self._status.__exit__(*args)
+
+    def update(self, message: str) -> None:
+        """Update the status message."""
+        if self._status:
+            self._status.update(message)
 
 
 def create_table(title: str, columns: list[str]) -> Table:

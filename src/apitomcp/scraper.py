@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from typing import Callable
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup, Tag
 from markitdown import MarkItDown
+
+# Number of parallel fetches
+MAX_WORKERS = 8
 
 
 @dataclass
@@ -28,23 +33,28 @@ class Operation:
 class ScrapingResult:
     """Result of scraping API documentation."""
 
-    operations: list[Operation]
+    page_markdowns: list[PageMarkdown]  # Individual page contents for LLM extraction
     base_url: str
     pages_scraped: int
-    raw_markdown: str  # For fallback if operation extraction fails
+    raw_markdown: str  # Combined markdown for fallback
     auth_content: str = ""  # Extracted authentication documentation
 
 
-# Patterns for identifying API operations
-HTTP_METHOD_PATTERN = re.compile(
-    r"\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(/[^\s\)\"\'<>\n]+)",
-    re.IGNORECASE,
-)
+@dataclass
+class PageMarkdown:
+    """A scraped page's markdown content and metadata."""
+    url: str
+    markdown: str
 
-CURL_PATTERN = re.compile(
-    r"curl\s+.*?(?:--request|-X)\s+(GET|POST|PUT|PATCH|DELETE)\s+.*?(https?://[^\s\"\']+|[\"\'](https?://[^\s\"\']+)[\"\'])",
-    re.IGNORECASE | re.DOTALL,
-)
+
+@dataclass
+class ScrapeProgress:
+    """Progress update during scraping."""
+
+    pages_scraped: int
+    pages_queued: int
+    current_url: str
+
 
 # Navigation link keywords (prioritize these)
 NAV_KEYWORDS = [
@@ -129,20 +139,22 @@ AUTH_HEADING_PATTERN = re.compile(
 def scrape_documentation(
     url: str,
     max_pages: int = 200,
+    on_progress: Callable[[ScrapeProgress], None] | None = None,
 ) -> ScrapingResult:
     """
-    Scrape API documentation from a URL and extract operations.
+    Scrape API documentation from a URL.
 
     Args:
         url: The starting URL to scrape
         max_pages: Maximum number of pages to crawl
+        on_progress: Optional callback for progress updates
 
     Returns:
-        ScrapingResult with extracted operations and metadata
+        ScrapingResult with page markdowns for LLM extraction
     """
     visited: set[str] = set()
-    all_operations: list[Operation] = []
-    markdown_parts: list[str] = []
+    page_markdowns: list[PageMarkdown] = []
+    markdown_parts: list[str] = []  # For combined raw markdown
     auth_content_parts: list[str] = []  # Collect auth documentation
 
     # Parse the starting URL to get the domain
@@ -275,98 +287,16 @@ def scrape_documentation(
 
         return links
 
-    def extract_operations_from_content(
-        content: str, source_url: str
-    ) -> list[Operation]:
-        """Extract API operations from page content."""
-        operations: list[Operation] = []
-        seen_ops: set[tuple[str, str]] = set()
+    @dataclass
+    class PageResult:
+        """Result from scraping a single page."""
+        url: str
+        links: list[tuple[int, str]]
+        markdown: str
+        auth_content: str
 
-        # Find HTTP method + path patterns
-        for match in HTTP_METHOD_PATTERN.finditer(content):
-            method = match.group(1).upper()
-            path = match.group(2)
-
-            # Clean up the path
-            path = path.rstrip(".,;:)")
-
-            # Skip if it doesn't look like an API path
-            if not path.startswith("/") or len(path) < 2:
-                continue
-
-            # Skip duplicates
-            op_key = (method, path)
-            if op_key in seen_ops:
-                continue
-            seen_ops.add(op_key)
-
-            # Extract context around the match
-            start = max(0, match.start() - 500)
-            end = min(len(content), match.end() + 2000)
-            context = content[start:end]
-
-            # Try to extract description (text before the method)
-            pre_match = content[max(0, match.start() - 500) : match.start()]
-            lines = pre_match.strip().split("\n")
-            description = ""
-            for line in reversed(lines):
-                line = line.strip()
-                if line and not line.startswith("#") and len(line) > 10:
-                    description = line
-                    break
-
-            operations.append(
-                Operation(
-                    method=method,
-                    path=path,
-                    description=description,
-                    parameters_text=context,
-                    source_url=source_url,
-                )
-            )
-
-        # Also look for cURL examples
-        for match in CURL_PATTERN.finditer(content):
-            method = match.group(1).upper()
-            url_match = match.group(2) or match.group(3)
-
-            if url_match:
-                # Extract path from URL
-                parsed = urlparse(url_match.strip("\"'"))
-                path = parsed.path
-
-                if path and path != "/":
-                    op_key = (method, path)
-                    if op_key not in seen_ops:
-                        seen_ops.add(op_key)
-
-                        # Get the full cURL command
-                        curl_start = content.rfind("curl", 0, match.start() + 10)
-                        if curl_start != -1:
-                            curl_end = content.find("\n\n", match.end())
-                            if curl_end == -1:
-                                curl_end = min(len(content), match.end() + 500)
-                            curl_example = content[curl_start:curl_end].strip()
-
-                            operations.append(
-                                Operation(
-                                    method=method,
-                                    path=path,
-                                    examples=[curl_example],
-                                    source_url=source_url,
-                                )
-                            )
-
-        return operations
-
-    def scrape_page(page_url: str) -> list[tuple[int, str]]:
-        """Scrape a single page and return prioritized links to follow."""
-        if page_url in visited:
-            return []
-
-        visited.add(page_url)
-        links_to_follow: list[tuple[int, str]] = []
-
+    def fetch_page(page_url: str) -> PageResult | None:
+        """Fetch and parse a single page. Thread-safe (no shared state mutation)."""
         try:
             response = httpx.get(
                 page_url,
@@ -378,7 +308,7 @@ def scrape_documentation(
             )
             response.raise_for_status()
         except httpx.HTTPError:
-            return []
+            return None
 
         # Parse HTML
         soup = BeautifulSoup(response.text, "html.parser")
@@ -388,67 +318,81 @@ def scrape_documentation(
             element.decompose()
 
         # Extract navigation links
-        links_to_follow = extract_navigation_links(soup, page_url)
+        links = extract_navigation_links(soup, page_url)
 
-        # Convert to markdown
+        # Convert to markdown (each thread needs its own converter)
+        local_converter = MarkItDown()
         try:
-            result = md_converter.convert_stream(
+            result = local_converter.convert_stream(
                 response.text.encode("utf-8"),
                 file_extension=".html",
             )
             markdown = result.text_content
         except Exception:
-            # Fallback to basic text extraction
             markdown = soup.get_text(separator="\n", strip=True)
 
+        # Extract auth content
+        auth_content = ""
         if markdown:
-            markdown_parts.append(f"# Source: {page_url}\n\n{markdown}\n\n---\n")
-
-            # Extract operations from this page
-            page_operations = extract_operations_from_content(markdown, page_url)
-            all_operations.extend(page_operations)
-
-            # Collect auth content
-            # If URL looks auth-related, include entire page
             if is_auth_related_url(page_url):
-                auth_content_parts.append(f"# Auth Source: {page_url}\n\n{markdown}")
+                auth_content = f"# Auth Source: {page_url}\n\n{markdown}"
             else:
-                # Otherwise, extract just auth sections
                 auth_sections = extract_auth_sections(markdown)
                 if auth_sections:
-                    auth_content_parts.append(
-                        f"# Auth Section from: {page_url}\n\n{auth_sections}"
-                    )
+                    auth_content = f"# Auth Section from: {page_url}\n\n{auth_sections}"
 
-        return links_to_follow
+        return PageResult(
+            url=page_url,
+            links=links,
+            markdown=markdown or "",
+            auth_content=auth_content,
+        )
 
-    # Start scraping with priority queue
-    while pages_to_visit and len(visited) < max_pages:
-        # Sort by priority and get the highest priority page
-        pages_to_visit.sort(key=lambda x: x[0])
-        _, current_url = pages_to_visit.pop(0)
+    # Parallel scraping with thread pool
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        while pages_to_visit and len(visited) < max_pages:
+            # Sort by priority and get batch of highest priority URLs
+            pages_to_visit.sort(key=lambda x: x[0])
+            
+            # Get batch of URLs to fetch (up to MAX_WORKERS, respecting max_pages)
+            batch_urls: list[str] = []
+            while pages_to_visit and len(batch_urls) < MAX_WORKERS and len(visited) + len(batch_urls) < max_pages:
+                _, url = pages_to_visit.pop(0)
+                if url not in visited:
+                    batch_urls.append(url)
+                    visited.add(url)  # Mark as visited before fetching to avoid duplicates
 
-        if current_url in visited:
-            continue
+            if not batch_urls:
+                break
 
-        new_links = scrape_page(current_url)
-
-        # Add new links to queue
-        for priority, link in new_links:
-            if link not in visited:
-                pages_to_visit.append((priority, link))
-
-    # Deduplicate operations by (method, path)
-    seen: set[tuple[str, str]] = set()
-    unique_operations: list[Operation] = []
-    for op in all_operations:
-        key = (op.method, op.path)
-        if key not in seen:
-            seen.add(key)
-            unique_operations.append(op)
-
-    # Sort operations by path for consistent ordering
-    unique_operations.sort(key=lambda op: (op.path, op.method))
+            # Fetch pages in parallel
+            futures = {executor.submit(fetch_page, url): url for url in batch_urls}
+            
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    # Collect results
+                    if result.markdown:
+                        page_markdowns.append(PageMarkdown(
+                            url=result.url,
+                            markdown=result.markdown,
+                        ))
+                        markdown_parts.append(f"# Source: {result.url}\n\n{result.markdown}\n\n---\n")
+                    if result.auth_content:
+                        auth_content_parts.append(result.auth_content)
+                    
+                    # Add new links to queue
+                    for priority, link in result.links:
+                        if link not in visited:
+                            pages_to_visit.append((priority, link))
+                    
+                    # Update progress after each page completes
+                    if on_progress:
+                        on_progress(ScrapeProgress(
+                            pages_scraped=len(visited),
+                            pages_queued=len(pages_to_visit),
+                            current_url=result.url,
+                        ))
 
     # Detect base URL
     base_url = detect_api_base_url(markdown_parts, domain)
@@ -460,7 +404,7 @@ def scrape_documentation(
     combined_auth_content = "\n\n---\n\n".join(auth_content_parts)
 
     return ScrapingResult(
-        operations=unique_operations,
+        page_markdowns=page_markdowns,
         base_url=base_url,
         pages_scraped=len(visited),
         raw_markdown=combined_markdown,
@@ -495,24 +439,3 @@ def detect_api_base_url(markdown_parts: list[str], domain: str) -> str:
     return f"https://api.{parsed.netloc.replace('www.', '')}"
 
 
-def merge_operations(operations: list[Operation]) -> list[Operation]:
-    """Merge duplicate operations, combining their information."""
-    merged: dict[tuple[str, str], Operation] = {}
-
-    for op in operations:
-        key = (op.method, op.path)
-
-        if key not in merged:
-            merged[key] = op
-        else:
-            existing = merged[key]
-            # Merge examples
-            existing.examples.extend(op.examples)
-            # Use longer description
-            if len(op.description) > len(existing.description):
-                existing.description = op.description
-            # Combine parameters text
-            if op.parameters_text and op.parameters_text not in existing.parameters_text:
-                existing.parameters_text += "\n\n" + op.parameters_text
-
-    return list(merged.values())

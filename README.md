@@ -4,6 +4,18 @@ Convert any API documentation into an MCP server for Cursor in minutes.
 
 Point it at API docs, and it scrapes, generates an OpenAPI spec, and creates a fully functional MCP server you can chat with.
 
+## Installation
+
+```bash
+pip install apitomcp
+```
+
+Or with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv pip install apitomcp
+```
+
 ## Quickstart
 
 ```bash

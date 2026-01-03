@@ -88,6 +88,22 @@ def openapi_type_to_python(schema: dict) -> type:
     return type_mapping.get(openapi_type, str)
 
 
+def sanitize_param_name(name: str) -> str:
+    """Convert parameter name to valid Python identifier.
+    
+    Replaces dots, hyphens, and other invalid characters with underscores.
+    """
+    import re
+    # Replace common invalid characters with underscores
+    sanitized = re.sub(r'[.\-\[\]{}]', '_', name)
+    # Ensure it starts with a letter or underscore
+    if sanitized and sanitized[0].isdigit():
+        sanitized = '_' + sanitized
+    # Remove any remaining invalid characters
+    sanitized = re.sub(r'[^a-zA-Z0-9_]', '', sanitized)
+    return sanitized
+
+
 def create_tool_function(
     base_url: str,
     path: str,
@@ -111,10 +127,15 @@ def create_tool_function(
     request_body = operation.get("requestBody", {})
 
     # Build parameter info for the dynamic function
+    # Maps sanitized Python names to original API parameter names
+    param_name_map: dict[str, str] = {}
     param_info = []
 
     for param in parameters:
-        param_name = param.get("name", "")
+        original_name = param.get("name", "")
+        sanitized_name = sanitize_param_name(original_name)
+        param_name_map[sanitized_name] = original_name
+        
         param_required = param.get("required", False)
         param_schema = param.get("schema", {})
         param_type = openapi_type_to_python(param_schema)
@@ -124,7 +145,8 @@ def create_tool_function(
 
         param_info.append(
             {
-                "name": param_name,
+                "name": sanitized_name,
+                "original_name": original_name,
                 "required": param_required,
                 "type": param_type,
                 "default": param_default,
@@ -142,10 +164,13 @@ def create_tool_function(
             properties = schema.get("properties", {})
             required_props = schema.get("required", [])
 
-            for prop_name, prop_schema in properties.items():
-                body_properties[prop_name] = {
+            for original_prop_name, prop_schema in properties.items():
+                sanitized_prop_name = sanitize_param_name(original_prop_name)
+                param_name_map[sanitized_prop_name] = original_prop_name
+                body_properties[sanitized_prop_name] = {
+                    "original_name": original_prop_name,
                     "type": openapi_type_to_python(prop_schema),
-                    "required": prop_name in required_props,
+                    "required": original_prop_name in required_props,
                     "description": prop_schema.get("description", ""),
                 }
             break  # Only process first content type
@@ -190,16 +215,24 @@ def create_tool_function(
 
     signature = ", ".join(sig_parts)
 
-    # Build docstring
+    # Build docstring (use original names for documentation)
     doc_lines = [f"Execute {method.upper()} {path}"]
     if param_info or body_properties:
         doc_lines.append("\nArgs:")
         for p in param_info:
             req = " (required)" if p["required"] else ""
-            doc_lines.append(f"    {p['name']}: {p['description']}{req}")
+            # Show sanitized name with original in parentheses if different
+            if p["name"] != p["original_name"]:
+                doc_lines.append(f"    {p['name']} ({p['original_name']}): {p['description']}{req}")
+            else:
+                doc_lines.append(f"    {p['name']}: {p['description']}{req}")
         for prop_name, prop_info_item in body_properties.items():
             req = " (required)" if prop_info_item["required"] else ""
-            doc_lines.append(f"    {prop_name}: {prop_info_item['description']}{req}")
+            original = prop_info_item["original_name"]
+            if prop_name != original:
+                doc_lines.append(f"    {prop_name} ({original}): {prop_info_item['description']}{req}")
+            else:
+                doc_lines.append(f"    {prop_name}: {prop_info_item['description']}{req}")
 
     docstring = "\n".join(doc_lines)
 
@@ -227,32 +260,36 @@ def create_tool_function(
         # Separate path, query, and header parameters
         query_params = {}
 
-        for param in parameters:
-            param_name = param.get("name", "")
-            param_in = param.get("in", "query")
+        for p in param_info:
+            sanitized_name = p["name"]
+            original_name = p["original_name"]
+            param_in = p["in"]
 
-            if param_name in kwargs_dict and kwargs_dict[param_name] is not None:
-                value = kwargs_dict[param_name]
+            if sanitized_name in kwargs_dict and kwargs_dict[sanitized_name] is not None:
+                value = kwargs_dict[sanitized_name]
 
                 if param_in == "path":
-                    url = url.replace(f"{{{param_name}}}", str(value))
+                    url = url.replace(f"{{{original_name}}}", str(value))
                 elif param_in == "query":
-                    # Handle array types
+                    # Handle array types - use original name for API
                     if isinstance(value, list):
-                        query_params[param_name] = ",".join(str(v) for v in value)
+                        query_params[original_name] = ",".join(str(v) for v in value)
                     else:
-                        query_params[param_name] = value
+                        query_params[original_name] = value
                 elif param_in == "header":
-                    request_headers[param_name] = str(value)
+                    request_headers[original_name] = str(value)
 
         # Handle request body
         json_body = None
         form_data = None
 
         if body_properties:
-            body_data = {
-                k: v for k, v in kwargs_dict.items() if k in body_properties and v is not None
-            }
+            # Convert sanitized names back to original names for API
+            body_data = {}
+            for sanitized_name, v in kwargs_dict.items():
+                if sanitized_name in body_properties and v is not None:
+                    original_name = body_properties[sanitized_name]["original_name"]
+                    body_data[original_name] = v
 
             if body_data:
                 # Check content type from spec

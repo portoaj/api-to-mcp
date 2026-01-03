@@ -1,12 +1,12 @@
 [project]
 name = "apitomcp"
-version = "0.1.0"
+version = "0.1.2"
 description = "Convert any API documentation into an MCP server"
 readme = "README.md"
 license = "MIT"
-requires-python = "==3.13.*"
+requires-python = ">=3.10"
 authors = [
-    { name = "Your Name", email = "you@example.com" }
+    { name = "Andrew Masek", email = "andrewmasek@gmail.com" }
 ]
 keywords = ["mcp", "api", "openapi", "llm", "cursor", "claude"]
 classifiers = [
@@ -14,6 +14,9 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Code Generators",
 ]

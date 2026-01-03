@@ -6,11 +6,11 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from apitomcp.config import LLMConfig
-    from apitomcp.scraper import Operation
+    from apitomcp.scraper import Operation, PageMarkdown
 
 
 @dataclass
@@ -377,6 +377,243 @@ Return ONLY the JSON, no other text."""
     parsed = urlparse(source_url)
     return f"{parsed.scheme}://{parsed.netloc}"
 
+
+# ============================================================================
+# LLM-Based Operation Extraction
+# ============================================================================
+
+EXTRACTION_SYSTEM_PROMPT = """You are an expert API documentation analyzer.
+
+Your task is to identify all API operations (endpoints) documented on a page and extract structured information about each one.
+
+CRITICAL RULES:
+1. ONLY extract operations that are explicitly documented on the page
+2. DO NOT invent or guess operations that aren't clearly documented
+3. Each operation must have at minimum: HTTP method and path
+4. If an operation appears multiple times (e.g., in examples), include it only once
+5. Extract parameters, request body, and response info if documented
+6. Paths should start with / (extract from full URLs if needed)"""
+
+EXTRACTION_USER_PROMPT = """Analyze this API documentation page and extract ALL API operations (endpoints) that are documented.
+
+SOURCE URL: {source_url}
+
+DOCUMENTATION CONTENT:
+{content}
+
+For each API operation found, extract:
+- method: HTTP method (GET, POST, PUT, PATCH, DELETE, etc.)
+- path: The endpoint path (e.g., /users/{{id}}, /albums)
+- summary: Brief description (1 line)
+- description: Longer description if available
+- parameters: List of path/query parameters with name, type, required, description
+- request_body: Request body schema if documented
+- response_example: Example response if shown
+
+Return a JSON object with this structure:
+{{
+  "operations": [
+    {{
+      "method": "GET",
+      "path": "/users/{{id}}",
+      "summary": "Get a user by ID",
+      "description": "Returns detailed information about a specific user",
+      "parameters": [
+        {{"name": "id", "in": "path", "type": "string", "required": true, "description": "User ID"}}
+      ]
+    }}
+  ]
+}}
+
+If NO API operations are documented on this page, return:
+{{"operations": []}}
+
+Return ONLY the JSON, no other text."""
+
+
+async def extract_operations_from_page(
+    markdown: str,
+    source_url: str,
+    config: "LLMConfig",
+    stats: "UsageStats",
+) -> list["Operation"]:
+    """
+    Use LLM to extract API operations from a documentation page.
+
+    Args:
+        markdown: The page content as markdown
+        source_url: The URL the page was scraped from
+        config: LLM configuration
+        stats: Usage stats to update
+
+    Returns:
+        List of Operation objects found on the page
+    """
+    import litellm
+    from apitomcp.scraper import Operation
+
+    litellm.suppress_debug_info = True
+    _set_api_key_env(config)
+
+    model = config.get("llm_model")
+    if not model:
+        return []
+
+    # Skip very short pages
+    if not markdown or len(markdown.strip()) < 100:
+        return []
+
+    # Truncate if too long
+    max_length = 12000
+    if len(markdown) > max_length:
+        markdown = markdown[:max_length] + "\n[truncated]"
+
+    user_prompt = EXTRACTION_USER_PROMPT.format(
+        source_url=source_url,
+        content=markdown,
+    )
+
+    try:
+        response = await litellm.acompletion(
+            model=model,
+            messages=[
+                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=2000,
+            temperature=0.1,
+        )
+
+        # Track usage
+        stats.add_response(response, model)
+
+        content = response.choices[0].message.content
+        result = extract_json(content)
+
+        operations: list[Operation] = []
+        for op_data in result.get("operations", []):
+            method = op_data.get("method", "").upper()
+            path = op_data.get("path", "")
+
+            # Validate required fields
+            if not method or not path:
+                continue
+
+            # Ensure path starts with /
+            if not path.startswith("/"):
+                continue
+
+            # Build parameters text from extracted params
+            params_text = ""
+            if op_data.get("parameters"):
+                params_lines = []
+                for p in op_data["parameters"]:
+                    req = "required" if p.get("required") else "optional"
+                    params_lines.append(f"- {p.get('name')}: {p.get('type', 'string')} ({req}) - {p.get('description', '')}")
+                params_text = "\n".join(params_lines)
+
+            if op_data.get("request_body"):
+                params_text += f"\n\nRequest Body:\n{json.dumps(op_data['request_body'], indent=2)}"
+
+            operations.append(Operation(
+                method=method,
+                path=path,
+                summary=op_data.get("summary", ""),
+                description=op_data.get("description", ""),
+                parameters_text=params_text,
+                source_url=source_url,
+            ))
+
+        return operations
+
+    except Exception:
+        return []
+
+
+@dataclass
+class ExtractionProgress:
+    """Progress update during operation extraction."""
+    pages_processed: int
+    total_pages: int
+    operations_found: int
+    current_url: str
+
+
+async def extract_operations_parallel(
+    pages: list[PageMarkdown],
+    config: "LLMConfig",
+    on_progress: "Callable[[ExtractionProgress], None] | None" = None,
+) -> tuple[list["Operation"], "UsageStats"]:
+    """
+    Extract operations from all pages using parallel LLM calls.
+
+    Args:
+        pages: List of PageMarkdown objects with url and markdown content
+        config: LLM configuration
+        on_progress: Optional callback for progress updates
+
+    Returns:
+        Tuple of (list of all operations found, usage stats)
+    """
+    from apitomcp.scraper import Operation, PageMarkdown
+
+    stats = UsageStats()
+    global _current_stats
+    _current_stats = stats
+
+    all_operations: list[Operation] = []
+    seen_ops: set[tuple[str, str]] = set()  # For deduplication
+
+    # Process pages concurrently with semaphore to limit parallelism
+    semaphore = asyncio.Semaphore(10)  # Limit concurrent LLM calls
+    processed_count = 0
+
+    async def process_page(page: PageMarkdown) -> list[Operation]:
+        nonlocal processed_count
+        async with semaphore:
+            ops = await extract_operations_from_page(
+                markdown=page.markdown,
+                source_url=page.url,
+                config=config,
+                stats=stats,
+            )
+            processed_count += 1
+            return ops
+
+    # Create tasks for all pages
+    tasks = [process_page(page) for page in pages]
+
+    # Process with progress updates
+    for coro in asyncio.as_completed(tasks):
+        page_ops = await coro
+        
+        # Deduplicate and add operations
+        for op in page_ops:
+            key = (op.method, op.path)
+            if key not in seen_ops:
+                seen_ops.add(key)
+                all_operations.append(op)
+
+        # Report progress
+        if on_progress:
+            # Find current URL (approximate since as_completed doesn't preserve order)
+            current_url = pages[min(processed_count - 1, len(pages) - 1)].url if pages else ""
+            on_progress(ExtractionProgress(
+                pages_processed=processed_count,
+                total_pages=len(pages),
+                operations_found=len(all_operations),
+                current_url=current_url,
+            ))
+
+    # Sort operations by path for consistent ordering
+    all_operations.sort(key=lambda op: (op.path, op.method))
+
+    return all_operations, stats
+
+
+# ============================================================================
+# OpenAPI Specification Generation
+# ============================================================================
 
 SYSTEM_PROMPT = """You are an expert API documentation analyzer and OpenAPI specification generator.
 
