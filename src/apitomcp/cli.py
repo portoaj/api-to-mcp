@@ -515,6 +515,7 @@ def generate() -> None:
                 extract_operations_parallel(
                     pages=scrape_result.page_markdowns,
                     config=config,
+                    base_url=scrape_result.base_url,
                     on_progress=on_extraction_progress,
                 )
             )

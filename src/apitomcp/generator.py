@@ -384,48 +384,66 @@ Return ONLY the JSON, no other text."""
 
 EXTRACTION_SYSTEM_PROMPT = """You are an expert API documentation analyzer.
 
-Your task is to identify all API operations (endpoints) documented on a page and extract structured information about each one.
+Your task is to identify API operations (endpoints) documented on a page and extract structured information.
 
 CRITICAL RULES:
-1. ONLY extract operations that are explicitly documented on the page
-2. DO NOT invent or guess operations that aren't clearly documented
-3. Each operation must have at minimum: HTTP method and path
-4. If an operation appears multiple times (e.g., in examples), include it only once
-5. Extract parameters, request body, and response info if documented
-6. Paths should start with / (extract from full URLs if needed)"""
+1. ONLY extract operations with paths EXACTLY as documented - do not invent variations
+2. DO NOT create singular/plural variants (if docs show /albums/{id}, do not also create /album/{id})
+3. SKIP paths that contain hardcoded IDs or example values (e.g., /tracks/2TpxZ7JUBn3uw46aR7qd6V)
+4. SKIP paths that look like examples rather than endpoint definitions
+5. If a path appears in a curl example, extract the PATTERN not the literal URL
+   - curl example: GET /albums/4aawyAB9vmqN3uQ7FjRGTy -> extract as /albums/{id}
+6. Each operation must have: HTTP method and a parameterized path template
+7. If an operation looks wrong, malformed, or like garbage data - DO NOT include it
+8. When in doubt, OMIT rather than guess
+9. DO NOT infer HTTP methods from endpoint names - extract the EXACT method documented
+   - /delete-entitlements might use POST, not DELETE
+   - /get-entitlements might use POST, not GET
+   - Only use the method explicitly shown in the documentation
 
-EXTRACTION_USER_PROMPT = """Analyze this API documentation page and extract ALL API operations (endpoints) that are documented.
+PATH VALIDATION:
+- Valid: /users/{id}, /albums/{album_id}/tracks, /me/player
+- Invalid: /albums/4aawyAB9vmqN3uQ7FjRGTy (hardcoded ID)
+- Invalid: /album/{id} if docs only show /albums/{id} (don't invent variants)"""
+
+EXTRACTION_USER_PROMPT = """Analyze this API documentation page and extract API operations (endpoints).
 
 SOURCE URL: {source_url}
+API BASE URL: {base_url}
 
 DOCUMENTATION CONTENT:
 {content}
 
-For each API operation found, extract:
-- method: HTTP method (GET, POST, PUT, PATCH, DELETE, etc.)
-- path: The endpoint path (e.g., /users/{{id}}, /albums)
+IMPORTANT:
+- Extract paths RELATIVE to the base URL (if base is https://api.spotify.com/v1, path /v1/albums should be output as /albums)
+- Only extract operations that are CLEARLY DEFINED as endpoints, not example URLs
+- If a path contains what looks like a hardcoded ID (alphanumeric strings like "4aawyAB9vmqN3uQ7FjRGTy"), SKIP it entirely
+- Do NOT invent endpoint variations - extract EXACTLY what is documented
+- Do NOT infer HTTP methods from endpoint names (e.g., /delete-* might use POST not DELETE) - use ONLY the method shown in docs
+
+For each valid API operation found, extract:
+- method: HTTP method (GET, POST, PUT, PATCH, DELETE)
+- path: The endpoint path template (e.g., /users/{{id}}, /albums)
 - summary: Brief description (1 line)
 - description: Longer description if available
-- parameters: List of path/query parameters with name, type, required, description
+- parameters: Path/query parameters with name, type, required, description
 - request_body: Request body schema if documented
-- response_example: Example response if shown
 
-Return a JSON object with this structure:
+Return JSON:
 {{
   "operations": [
     {{
       "method": "GET",
-      "path": "/users/{{id}}",
-      "summary": "Get a user by ID",
-      "description": "Returns detailed information about a specific user",
+      "path": "/albums/{{id}}",
+      "summary": "Get an album",
       "parameters": [
-        {{"name": "id", "in": "path", "type": "string", "required": true, "description": "User ID"}}
+        {{"name": "id", "in": "path", "type": "string", "required": true, "description": "Spotify album ID"}}
       ]
     }}
   ]
 }}
 
-If NO API operations are documented on this page, return:
+If NO valid API operations are found, or all candidates look invalid, return:
 {{"operations": []}}
 
 Return ONLY the JSON, no other text."""
@@ -436,6 +454,7 @@ async def extract_operations_from_page(
     source_url: str,
     config: "LLMConfig",
     stats: "UsageStats",
+    base_url: str = "",
 ) -> list["Operation"]:
     """
     Use LLM to extract API operations from a documentation page.
@@ -445,6 +464,7 @@ async def extract_operations_from_page(
         source_url: The URL the page was scraped from
         config: LLM configuration
         stats: Usage stats to update
+        base_url: API base URL for path normalization
 
     Returns:
         List of Operation objects found on the page
@@ -470,6 +490,7 @@ async def extract_operations_from_page(
 
     user_prompt = EXTRACTION_USER_PROMPT.format(
         source_url=source_url,
+        base_url=base_url or "unknown",
         content=markdown,
     )
 
@@ -542,6 +563,7 @@ class ExtractionProgress:
 async def extract_operations_parallel(
     pages: list[PageMarkdown],
     config: "LLMConfig",
+    base_url: str = "",
     on_progress: "Callable[[ExtractionProgress], None] | None" = None,
 ) -> tuple[list["Operation"], "UsageStats"]:
     """
@@ -550,6 +572,7 @@ async def extract_operations_parallel(
     Args:
         pages: List of PageMarkdown objects with url and markdown content
         config: LLM configuration
+        base_url: API base URL for path normalization
         on_progress: Optional callback for progress updates
 
     Returns:
@@ -576,6 +599,7 @@ async def extract_operations_parallel(
                 source_url=page.url,
                 config=config,
                 stats=stats,
+                base_url=base_url,
             )
             processed_count += 1
             return ops
