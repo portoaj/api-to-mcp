@@ -493,6 +493,18 @@ def generate() -> None:
 
     print_success(f"Scraped {scrape_result.pages_scraped} pages")
 
+    # Detect and confirm base URL BEFORE extraction so LLM gets correct value
+    from apitomcp.generator import detect_base_url_from_docs
+    
+    with spinner("Detecting API base URL..."):
+        detected_base_url = _run_async(
+            detect_base_url_from_docs(scrape_result.raw_markdown, url, config)
+        )
+    
+    base_url = prompt_text("Enter the API base URL", default=detected_base_url)
+    if not base_url:
+        base_url = detected_base_url
+
     # Phase 2: LLM extracts operations from each page
     if not scrape_result.page_markdowns:
         print_error("No content found in scraped pages.")
@@ -515,13 +527,17 @@ def generate() -> None:
                 extract_operations_parallel(
                     pages=scrape_result.page_markdowns,
                     config=config,
-                    base_url=scrape_result.base_url,
+                    base_url=base_url,
                     on_progress=on_extraction_progress,
                 )
             )
     except Exception as e:
         print_error(f"Failed to extract operations: {e}")
         raise typer.Exit(1)
+
+    # Normalize operation paths to be relative to base URL
+    from apitomcp.generator import normalize_operation_paths
+    operations = normalize_operation_paths(operations, base_url)
 
     # Show extraction results
     if operations:
@@ -535,19 +551,6 @@ def generate() -> None:
         console.print(f"\n[dim]Extraction: {extraction_stats.format_summary()}[/dim]")
     else:
         print_warning("No API operations found in documentation")
-
-    # Use LLM to detect base URL from documentation
-    from apitomcp.generator import detect_base_url_from_docs
-    
-    with spinner("Detecting API base URL..."):
-        detected_base_url = _run_async(
-            detect_base_url_from_docs(scrape_result.raw_markdown, url, config)
-        )
-    
-    # Prompt user to confirm/modify the base URL
-    base_url = prompt_text("Enter the API base URL", default=detected_base_url)
-    if not base_url:
-        base_url = detected_base_url
 
     # Generate server name from URL
     from urllib.parse import urlparse
@@ -783,7 +786,7 @@ def generate() -> None:
         if token_url:
             auth_config["token_url"] = token_url
 
-        client_id = prompt_text("Enter your Client ID")
+        client_id = prompt_text("Enter your Client ID", password=True)
         if client_id:
             auth_config["client_id"] = client_id
 

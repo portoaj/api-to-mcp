@@ -400,11 +400,18 @@ CRITICAL RULES:
    - /delete-entitlements might use POST, not DELETE
    - /get-entitlements might use POST, not GET
    - Only use the method explicitly shown in the documentation
+10. SKIP deprecated endpoints - if an endpoint is marked as "Deprecated" or "deprecated", do NOT include it
+    - Look for "Deprecated" badges, labels, or text near the endpoint
+    - Do NOT skip endpoints that say "will be deprecated" in the future - only skip currently deprecated ones
 
 PATH VALIDATION:
 - Valid: /users/{id}, /albums/{album_id}/tracks, /me/player
 - Invalid: /albums/4aawyAB9vmqN3uQ7FjRGTy (hardcoded ID)
-- Invalid: /album/{id} if docs only show /albums/{id} (don't invent variants)"""
+
+BASE URL PATH STRIPPING:
+- If base URL ends with /v1, /v2, /3, etc., strip that prefix from paths
+- Example: base URL "https://api.example.com/v1" + doc shows "/v1/users" -> return "/users"
+- The returned path should be RELATIVE to the base URL, not include the version prefix"""
 
 EXTRACTION_USER_PROMPT = """Analyze this API documentation page and extract API operations (endpoints).
 
@@ -415,11 +422,14 @@ DOCUMENTATION CONTENT:
 {content}
 
 IMPORTANT:
-- Extract paths RELATIVE to the base URL (if base is https://api.spotify.com/v1, path /v1/albums should be output as /albums)
+- STRIP the base URL path prefix from all extracted paths:
+  * If base URL is https://api.demo.com/v1, then /v1/albums -> /albums
+  * The path you return should NOT include a version prefix that's already in the base URL
 - Only extract operations that are CLEARLY DEFINED as endpoints, not example URLs
 - If a path contains what looks like a hardcoded ID (alphanumeric strings like "4aawyAB9vmqN3uQ7FjRGTy"), SKIP it entirely
 - Do NOT invent endpoint variations - extract EXACTLY what is documented
 - Do NOT infer HTTP methods from endpoint names (e.g., /delete-* might use POST not DELETE) - use ONLY the method shown in docs
+- SKIP any endpoint marked as "Deprecated" - do not include deprecated APIs
 
 For each valid API operation found, extract:
 - method: HTTP method (GET, POST, PUT, PATCH, DELETE)
@@ -633,6 +643,33 @@ async def extract_operations_parallel(
     all_operations.sort(key=lambda op: (op.path, op.method))
 
     return all_operations, stats
+
+
+def normalize_operation_paths(operations: list["Operation"], base_url: str) -> list["Operation"]:
+    """
+    Strip base URL path prefix from operation paths.
+    
+    For example, if base_url is "https://api.themoviedb.org/3",
+    then "/3/account/{id}" becomes "/account/{id}".
+    
+    Args:
+        operations: List of Operation objects to normalize
+        base_url: The API base URL containing the path prefix to strip
+        
+    Returns:
+        The same list with paths normalized (modified in place)
+    """
+    from urllib.parse import urlparse
+    
+    base_path = urlparse(base_url).path.rstrip("/")
+    if not base_path:
+        return operations
+    
+    for op in operations:
+        if op.path.startswith(base_path):
+            op.path = op.path[len(base_path):] or "/"
+    
+    return operations
 
 
 # ============================================================================
