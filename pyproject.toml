@@ -1,6 +1,6 @@
 [project]
 name = "apitomcp"
-version = "0.1.2"
+version = "0.1.3"
 description = "Convert any API documentation into an MCP server"
 readme = "README.md"
 license = "MIT"
@@ -36,8 +36,8 @@ dependencies = [
 apitomcp = "apitomcp.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/apitomcp"
-Repository = "https://github.com/yourusername/apitomcp"
+Homepage = "https://github.com/portoaj/api-to-mcp"
+Repository = "https://github.com/portoaj/api-to-mcp"
 
 [build-system]
 requires = ["hatchling"]

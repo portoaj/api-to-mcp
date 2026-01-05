@@ -1,8 +1,20 @@
-# api-to-mcp
+<p align="center">
+  <img src="assets/logo.png" alt="api-to-mcp" width="500">
+</p>
 
-Convert any API documentation into an MCP server for Cursor in minutes.
+<p align="center">
+  <a href="https://pypi.org/project/apitomcp/"><img src="https://img.shields.io/pypi/pyversions/apitomcp" alt="Python"></a>
+  <a href="https://pypi.org/project/apitomcp/"><img src="https://img.shields.io/pypi/v/apitomcp" alt="PyPI"></a>
+  <a href="https://github.com/portoaj/api-to-mcp/blob/master/LICENSE"><img src="https://img.shields.io/github/license/portoaj/api-to-mcp" alt="License"></a>
+</p>
 
-Point it at API docs, and it scrapes, generates an OpenAPI spec, and creates a fully functional MCP server you can chat with.
+Convert any API documentation into an MCP server in minutes.
+
+Point it at API docs, and it scrapes, generates an OpenAPI spec, creates a fully functional MCP server you can chat with, and installs it to Cursor or Claude Desktop.
+
+<p align="center">
+  <img src="assets/generateanimation.gif" alt="apitomcp generate demo" width="700">
+</p>
 
 ## Installation
 
@@ -27,12 +39,9 @@ apitomcp init
 
 # Generate an MCP server from any API docs
 apitomcp generate
-
-# Install to Cursor
-apitomcp install
 ```
 
-Restart Cursor and start chatting with your API.
+Restart Cursor/ Claude Desktop and start chatting with your API.
 
 ## What It Does
 
@@ -58,11 +67,11 @@ Restart Cursor and start chatting with your API.
 | `apitomcp init` | First-time setup - configure LLM provider and API key |
 | `apitomcp generate` | Generate an MCP server from API documentation |
 | `apitomcp list` | Show all generated servers |
-| `apitomcp install` | Install servers to Cursor |
+| `apitomcp install` | Install servers to Cursor or Claude Desktop |
 | `apitomcp delete` | Remove a generated server |
 | `apitomcp auth` | Update LLM settings |
 | `apitomcp output` | Export server files to current directory |
-| `apitomcp run <name>` | Run a server (used by Cursor, not manually) |
+| `apitomcp run <name>` | Run a server (typically used by Cursor or Claude Desktop, not manually) |
 
 ## Example
 
@@ -70,16 +79,17 @@ Restart Cursor and start chatting with your API.
 $ apitomcp generate
 
 # Enter: https://developer.spotify.com/documentation/web-api
-# It scrapes 150+ pages, finds 99 API operations
+# It scrapes 150+ pages, finds 99+ API operations
 # Generates OpenAPI spec in parallel
 # Detects OAuth2 client credentials auth
 # Prompts for your Spotify client ID and secret
-
-$ apitomcp install
-
-# Adds the server to Cursor's MCP config
-# Restart Cursor, then ask: "Get me Taylor Swift's top tracks"
 ```
+
+Then chat with your API in Cursor:
+
+<p align="center">
+  <img src="assets/themoviedbexample.gif" alt="Using TheMovieDB MCP server in Cursor" width="700">
+</p>
 
 ## How It Works
 
@@ -113,14 +123,14 @@ API Docs URL
 
 ## Supported LLM Providers
 
-- **OpenRouter** - Access to Claude, GPT, Gemini models
-- **Anthropic** - Claude Sonnet, Haiku, Opus
-- **OpenAI** - GPT-5.2, GPT-5.2 Mini
-- **Gemini** - Gemini 3 Pro, Gemini 2.5 Flash
+- **OpenRouter**
+- **Anthropic**
+- **OpenAI**
+- **Gemini**
 
 ## Requirements
 
-- Python 3.13+
+- Python 3.10-3.13
 - API key for one of the supported LLM providers
 
 ## Configuration
@@ -128,6 +138,14 @@ API Docs URL
 Config is stored in `~/.apitomcp/`:
 - `config.json` - LLM provider settings
 - `servers/<name>/` - Generated server files
+
+## Contributing
+
+Contributions are welcome! If you find a bug or have a feature request, please [open an issue](https://github.com/portoaj/api-to-mcp/issues). Pull requests are also appreciated—I'll review them as time allows.
+
+## Author
+
+Built by [@andrew_masek_](https://x.com/andrew_masek_)
 
 ## License
 
