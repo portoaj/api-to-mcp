@@ -78,11 +78,8 @@ Restart Cursor/ Claude Desktop and start chatting with your API.
 ```bash
 $ apitomcp generate
 
-# Enter: https://developer.spotify.com/documentation/web-api
-# It scrapes 150+ pages, finds 99+ API operations
-# Generates OpenAPI spec in parallel
-# Detects OAuth2 client credentials auth
-# Prompts for your Spotify client ID and secret
+# Enter: https://developer.themoviedb.org/docs/
+# Enter your API Read Access Token from https://www.themoviedb.org/settings/api
 ```
 
 Then chat with your API in Cursor:
