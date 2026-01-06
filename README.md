@@ -136,6 +136,10 @@ Config is stored in `~/.apitomcp/`:
 - `config.json` - LLM provider settings
 - `servers/<name>/` - Generated server files
 
+## Limitations
+
+This is a work in progress. The LLM-based operation extraction and auth detection aren't perfect—some APIs may need manual tweaking of the generated spec. If you run into issues or have improvements, Issues/ PRs are welcome!
+
 ## Contributing
 
 Contributions are welcome! If you find a bug or have a feature request, please [open an issue](https://github.com/portoaj/api-to-mcp/issues). Pull requests are also appreciated—I'll review them as time allows.
